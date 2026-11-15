@@ -1,0 +1,42 @@
+services:
+  db:
+    build:
+      context: ./db
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: logistics
+    # 评估场景关闭并行/JIT：EXPLAIN 成本在单机上更确定、可复现，也避免环境差异
+    command:
+      - "postgres"
+      - "-c"
+      - "max_parallel_workers_per_gather=0"
+      - "-c"
+      - "jit=off"
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d logistics"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ./api
+    environment:
+      # 单 API 进程内自建连接池，硬上限 2 条物理连接（见 app/db.py）
+      DB_DSN: "postgresql://app:app@db:5432/logistics"
+      POOL_MAX_CONNECTIONS: "2"
+      # 演示用：开启后可通过请求头 X-Demo-Pause-Seconds 在候选创建后暂停，便于断连演示
+      DEMO_PAUSE_ENABLED: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
