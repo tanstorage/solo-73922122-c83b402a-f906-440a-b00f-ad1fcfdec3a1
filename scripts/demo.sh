@@ -73,3 +73,25 @@ req '{"sample_id":"nightly_warehouse_scan",
       "candidates":[{"table":"public.package_scan","columns":["warehouse_id","scan_time"]}]}' | summarize
 echo "  连接池状态："
 curl -sS "$BASE_URL/health" | "$PY" -c "import json,sys; print('  ', json.dumps(json.load(sys.stdin)['pool'], ensure_ascii=False))"
+
+echo
+echo "== 6. 列更名预览（scan_time -> scanned_at，不执行查询、不改表） =="
+curl -sS -X POST "$BASE_URL/rename-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "old_column": "scan_time",
+    "new_column": "scanned_at",
+    "queries": [
+      "SELECT scan_id, scan_time FROM public.package_scan WHERE scan_time >= now() ORDER BY scan_time",
+      "WITH night AS (SELECT scan_id, scan_time FROM public.package_scan WHERE scan_time >= now()) SELECT scan_id, scan_time FROM night ORDER BY scan_time",
+      "SELECT * FROM public.package_scan"
+    ]
+  }' | "$PY" -m json.tool
+
+echo
+echo "== 7. 更名预览目录校验：新列名已存在必须 400 =="
+curl -sS -X POST "$BASE_URL/rename-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"old_column":"scan_time","new_column":"warehouse_id",
+       "queries":["SELECT scan_time FROM public.package_scan"]}' \
+  | "$PY" -m json.tool

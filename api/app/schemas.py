@@ -92,3 +92,70 @@ class HealthResponse(BaseModel):
     status: str
     pool: dict[str, Any]
     db: dict[str, Any]
+
+
+# ---------------- 列更名预览 ----------------
+
+MAX_RENAME_QUERIES = 5
+TARGET_SCHEMA = "public"
+TARGET_TABLE = "package_scan"
+
+
+class RenamePreviewRequest(BaseModel):
+    """列更名预览：旧列名、新列名 + 最多 5 条只读 SELECT。"""
+
+    old_column: str = Field(..., description="计划改名的旧列（必须存在于目标表）")
+    new_column: str = Field(..., description="改名后的新列名（不得与现有列重名）")
+    queries: list[str] = Field(
+        ..., min_length=1, max_length=MAX_RENAME_QUERIES,
+        description="待检查的只读 SELECT，最多 5 条；服务不会执行这些 SQL",
+    )
+
+    @field_validator("old_column", "new_column")
+    @classmethod
+    def _validate_ident(cls, v: str) -> str:
+        v = v.strip()
+        if not _IDENT_RE.match(v):
+            raise ValueError("列名必须是合法标识符（字母/下划线开头，最长 63）")
+        return v
+
+    @field_validator("queries")
+    @classmethod
+    def _validate_queries(cls, v: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for q in v:
+            if not isinstance(q, str):
+                raise ValueError("每条查询必须是字符串")
+            q = q.strip()
+            if not q:
+                raise ValueError("查询不能为空字符串")
+            if len(q) > MAX_SQL_LENGTH:
+                raise ValueError(f"单条 SQL 长度超过上限 {MAX_SQL_LENGTH} 字符")
+            cleaned.append(q)
+        return cleaned
+
+
+class RenamePreviewItem(BaseModel):
+    index: int = Field(..., description="查询在提交列表中的序号（从 0 开始）")
+    status: str = Field(..., description="rewritten=已安全改写；manual=需人工处理")
+    original_sql: str
+    rewritten_sql: str | None = Field(
+        None, description="status=manual 时为 null，绝不给出半成品改写"
+    )
+    reason: str | None = Field(None, description="manual 时的中文原因说明")
+    output_columns_preserved: bool | None = Field(
+        None, description="rewritten 时恒为 true：输出列名与原查询保持一致"
+    )
+    renamed_reference_count: int = Field(
+        0, description="实际改写的旧列引用位置数（0 表示该查询未引用旧列，原样返回）"
+    )
+
+
+class RenamePreviewResponse(BaseModel):
+    target_table: str
+    old_column: str
+    new_column: str
+    results: list[RenamePreviewItem]
+    summary: dict[str, Any] = Field(
+        ..., description="统计：total / rewritten / manual / changed"
+    )

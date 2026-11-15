@@ -1,6 +1,8 @@
-"""FastAPI 入口：HypoPG 候选索引成本评估 API。
+"""FastAPI 入口：候选索引成本评估（/evaluate）与列更名预览（/rename-preview）。
 
-仅暴露只读评估接口；查询不执行（EXPLAIN 无 ANALYZE），索引不落地（HypoPG 会话级假想）。
+两组接口均为只读：
+- 评估接口查询不执行（EXPLAIN 无 ANALYZE），索引不落地（HypoPG 会话级假想）；
+- 更名预览只读取 information_schema 列目录，提交的 SQL 仅做静态分析，不执行、不改表。
 """
 from __future__ import annotations
 
@@ -14,7 +16,14 @@ from psycopg.rows import dict_row
 from .config import get_settings
 from .db import TwoConnectionPool
 from .samples import SAMPLES
-from .schemas import EvaluateRequest, EvaluateResponse, HealthResponse
+from .schemas import (
+    EvaluateRequest,
+    EvaluateResponse,
+    HealthResponse,
+    RenamePreviewRequest,
+    RenamePreviewResponse,
+)
+from .rename_service import RenamePreviewError, preview_column_rename
 from .service import EvaluationError, evaluate
 from .validation import SQLValidationError
 
@@ -28,13 +37,15 @@ settings = get_settings()
 pool = TwoConnectionPool(settings)
 
 app = FastAPI(
-    title="夜间包裹扫描查询 · 候选索引成本评估 API",
+    title="夜间包裹扫描查询 · 索引评估与列更名预览 API",
     description=(
-        "提交只读 SELECT 与最多 3 个 B-tree 候选索引（表名 + 有序列名），"
-        "基于 PostgreSQL + HypoPG 返回无候选/启用全部候选的 EXPLAIN JSON、"
-        "总成本对比与被采纳候选。**只估算**：不执行查询，也不创建真实索引。"
+        "两组只读能力：\n"
+        "1. `/evaluate`：提交只读 SELECT 与最多 3 个 B-tree 候选索引，"
+        "基于 PostgreSQL + HypoPG 返回 EXPLAIN JSON 与成本对比（只估算，不执行、不建真实索引）；\n"
+        "2. `/rename-preview`：为 public.package_scan 的列更名预览夜间报表 SQL 改写，"
+        "只读取列目录、不执行提交的查询、不修改表；星号/歧义/不支持结构逐条标记人工处理。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -58,6 +69,11 @@ async def _sql_validation_handler(_: Request, exc: SQLValidationError):
 @app.exception_handler(EvaluationError)
 async def _evaluation_handler(_: Request, exc: EvaluationError):
     return JSONResponse(status_code=400, content={"error": "evaluation_rejected", "detail": str(exc)})
+
+
+@app.exception_handler(RenamePreviewError)
+async def _rename_handler(_: Request, exc: RenamePreviewError):
+    return JSONResponse(status_code=400, content={"error": "rename_preview_rejected", "detail": str(exc)})
 
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
@@ -160,3 +176,36 @@ async def evaluate_query(req: EvaluateRequest, request: Request) -> EvaluateResp
         len(result.rejected_candidates),
     )
     return result
+
+
+@app.post(
+    "/rename-preview",
+    response_model=RenamePreviewResponse,
+    tags=["rename-preview"],
+    responses={
+        400: {"description": "旧列不存在 / 新列名已存在 / 新旧同名 / 请求参数非法"},
+        500: {"description": "数据库内部错误；连接已清理后归还或丢弃"},
+    },
+)
+async def rename_preview(req: RenamePreviewRequest) -> RenamePreviewResponse:
+    """列更名预览：静态改写最多 5 条只读 SELECT。
+
+    - 只读取 information_schema 的现有列目录，**不执行**提交的查询，也不修改表；
+    - 可安全处理的查询返回改写 SQL，未显式起别名的裸列输出列保留旧输出名；
+    - 星号、歧义或不支持结构逐条返回 status=manual 与中文原因，不给改写 SQL。
+    """
+    try:
+        return await preview_column_rename(pool, req)
+    except RenamePreviewError:
+        raise
+    except SQLValidationError:
+        raise
+    except Exception as exc:
+        log.exception("更名预览请求失败: %r", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "rename_preview_failed",
+                "detail": "更名预览失败，未产生改写结果；连接已完成清理",
+            },
+        )
